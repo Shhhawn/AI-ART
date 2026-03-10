@@ -268,4 +268,4 @@ if __name__ == "__main__":
         art_sys.run_dynamic_pipeline(input_image=test_image, options=config_full)
         
     else:
-        print(f"[ERROR] Required input file not found: {test_image}") # 抛出运行时文件失联异常
+        print(f"[ERROR] Required input file not found: {test_image}")   # 抛出运行时文件失联异常
