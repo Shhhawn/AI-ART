@@ -3,14 +3,14 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 import numpy as np
-
+import math
 # 引入 HuggingFace 相关的模型与预处理器库
 from transformers import Swin2SRForImageSuperResolution, Swin2SRImageProcessor
 from transformers import BlipProcessor, BlipForConditionalGeneration
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
-from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionInpaintPipeline
+from diffusers import StableDiffusionXLImg2ImgPipeline, StableDiffusionXLInpaintPipeline, DPMSolverMultistepScheduler
 
 class ArtRestorationSystem:
     """
@@ -54,27 +54,67 @@ class ArtRestorationSystem:
         print("[INFO] [3/5] Loading Text-Segmentation Model (CLIPSeg)...")
         clipseg_model_id = "CIDAS/clipseg-rd64-refined"
         self.seg_processor = CLIPSegProcessor.from_pretrained(clipseg_model_id)
-        self.seg_model = CLIPSegForImageSegmentation.from_pretrained(clipseg_model_id).to(self.cpu_device) # 轻量级模型，锁定在 CPU 确保精度
+        self.seg_model = CLIPSegForImageSegmentation.from_pretrained(clipseg_model_id).to(self.device) # 轻量级模型，锁定在 CPU 确保精度
 
-        # 5. 加载全局图生图扩散模型
-        print("[INFO] [4/5] Loading Img2Img Pipeline (SD v1.5)...")
-        self.sd_pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float32 # 强制使用 float32 单精度，防止 MPS 溢出导致黑图
+        # 5. 加载全局图生图扩散模型 (全面升级为 SDXL 1.0)
+        print("[INFO] [4/5] Loading Img2Img Pipeline (SDXL 1.0)...")
+        self.sd_pipeline = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0", 
+            torch_dtype=torch.float16, # 必须用半精度，否则容易爆内存
+            variant="fp16",            # 直接下载半精度精简版权重，节省极大的硬盘空间和下载时间
+            use_safetensors=True
         ).to(self.device)
 
-        # 6. 加载局部重绘扩散模型
-        print("[INFO] [5/5] Loading Inpainting Pipeline (SD Inpainting)...")
-        self.inpaint_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-            "runwayml/stable-diffusion-inpainting", torch_dtype=torch.float32 # 强制使用 float32 单精度防御机制
+        # 6. 加载专用于局部重绘的 9通道 UNet 模型
+        print("[INFO] [5/5] Configuring Shared Inpainting Pipeline...")
+        self.inpaint_pipeline = StableDiffusionXLInpaintPipeline.from_pretrained(
+            "diffusers/stable-diffusion-xl-1.0-inpainting-0.1", 
+            torch_dtype=torch.float16, 
+            variant="fp16",
+            use_safetensors=True
         ).to(self.device)
+
+        print("[INFO] Enabling VAE slicing to optimize Apple Silicon memory...")
+        self.sd_pipeline.enable_vae_slicing()
+
+        # ==========================================
+        # 挂载 DPM++ 2M Karras 高阶调度器
+        # ==========================================
+        print("[INFO] Injecting DPM++ 2M Karras Scheduler for high-quality fast inference...")
+        
+        # 启用 Karras 噪声分布，这是目前能让 SDXL 在 20 步内达到极高画质的唯一真神
+        dpm_scheduler = DPMSolverMultistepScheduler.from_config(
+            self.sd_pipeline.scheduler.config,
+            use_karras_sigmas=True
+        )
+        self.sd_pipeline.scheduler = dpm_scheduler
+        self.inpaint_pipeline.scheduler = dpm_scheduler
         
         print("\n[SUCCESS] Initialization complete. All models ready.\n")
 
-    def _generate_text_mask(self, image: Image.Image, text_prompt: str, target_size=(512, 512)) -> Image.Image:
+    def _get_optimal_sdxl_size(self, image: Image.Image) -> tuple:
+        """基于 SDXL 黄金像素总数 (~1 Megapixel) 动态计算最佳宽高比"""
+        w, h = image.size
+        target_area = 896 * 896  # SDXL 的标准百万像素靶心
+        
+        # 计算原图的宽高比例
+        aspect_ratio = w / h
+        
+        # 按等面积公式推导目标长宽
+        new_w = math.sqrt(target_area * aspect_ratio)
+        new_h = math.sqrt(target_area / aspect_ratio)
+        
+        # 这是 SDXL 潜空间 (Latent Space) 的底层硬性要求
+        new_w = max(64, round(new_w / 64) * 64)
+        new_h = max(64, round(new_h / 64) * 64)
+        
+        return (int(new_w), int(new_h))
+
+    def _generate_text_mask(self, image: Image.Image, text_prompt: str, target_size=(1024, 1024)) -> Image.Image:
         """内部辅助方法：根据自然语言指令生成二值化目标掩膜 (Mask)"""
         print(f"[PROCESS] Segmenting masking region for: '{text_prompt}'...")
         # 将原始图像与自然语言转化为模型特征张量，并送入 CPU 设备
-        inputs = self.seg_processor(text=[text_prompt], images=[image], return_tensors="pt").to(self.cpu_device)
+        inputs = self.seg_processor(text=[text_prompt], images=[image], return_tensors="pt").to(self.device)
         
         with torch.no_grad(): # 阻断梯度反向传播以节省内存
             outputs = self.seg_model(**inputs) # 执行前向推理，获取分割热力图
@@ -86,7 +126,8 @@ class ArtRestorationSystem:
         
         mask_tensor = torch.sigmoid(preds[0][0]) > 0.5 # 应用 Sigmoid 激活并通过 0.5 阈值进行二值化切分
         mask_pil = Image.fromarray(mask_tensor.byte().cpu().numpy() * 255, mode="L") # 转换为单通道 (L模式) 的 8 位图像对象
-        return mask_pil.resize(target_size, Image.NEAREST) # 强制尺寸缩放至默认 512x512，并采用最近邻插值确保边缘黑白分明
+        mask_resized = mask_pil.resize(target_size, Image.LANCZOS)
+        return mask_resized.filter(ImageFilter.GaussianBlur(radius=16)) # 强制尺寸缩放至默认 512x512，并采用最近邻插值确保边缘黑白分明
 
     # ==========================================
     # 原子功能模块 (Atomic Modules)
@@ -94,15 +135,26 @@ class ArtRestorationSystem:
     def restore_and_enhance(self, image_path: str, output_path: str) -> str:
         """模块 1：执行图像画质清洗与 4x 超分辨放大"""
         print(f"[PROCESS] Enhancing image quality: {image_path}")
-        raw_image = Image.open(image_path).convert("RGB") # 读取文件并统一规范至 RGB 色彩空间
-        inputs = self.sr_processor(raw_image, return_tensors="pt").to(self.device) # 特征抽取并推入计算流
+        raw_image = Image.open(image_path).convert("RGB")
+        
+        w, h = raw_image.size
+        # 即使不用官方 processor，底层 Swin2SR 依然要求输入必须是 8 的倍数
+        new_w = (w // 8) * 8
+        new_h = (h // 8) * 8
+        raw_image = raw_image.resize((new_w, new_h))
+        
+        # 【终极修复】：彻底抛弃 HuggingFace 官方的 Processor！它内部有隐蔽的强制裁切 1:1 Bug！
+        # 手动将 PIL 图像转化为神经网络需要的 Tensor (B, C, H, W)，并归一化到 0~1
+        img_array = np.array(raw_image).astype(np.float32) / 255.0
+        pixel_values = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
-            outputs = self.sr_model(inputs.pixel_values) # 通过 Swin Transformer 进行高频细节重建
+            # 直接投喂纯净的 Tensor，再也没有任何中间商能压扁你的图了
+            outputs = self.sr_model(pixel_values=pixel_values) 
             
-        output_tensor = outputs.reconstruction.cpu().squeeze(0).clamp(0, 1) # 剔除批次维度，并将像素值极值硬截断至安全范围 [0, 1]
-        output_array = (output_tensor.numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8) # 转为矩阵，变换通道序为 [H, W, C]，并还原至 255 像素域
-        Image.fromarray(output_array).save(output_path) # 落盘保存为常规图像文件
+        output_tensor = outputs.reconstruction.cpu().squeeze(0).clamp(0, 1) 
+        output_array = (output_tensor.numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8) 
+        Image.fromarray(output_array).save(output_path) 
         print(f"[SUCCESS] Enhanced image saved to: {output_path}")
         return output_path
 
@@ -119,48 +171,102 @@ class ArtRestorationSystem:
         print(f"[RESULT] Extracted semantics: '{desc}'")
         return desc
 
-    def style_transfer(self, image_path: str, prompt: str, output_path: str, strength: float = 0.6) -> str:
+    def style_transfer(
+            self, 
+            image_path: str, 
+            prompt: str, 
+            output_path: str, 
+            guidance_scale: float = 8.5, 
+            strength: float = 0.6,
+            step_callback=None
+        ) -> str:
         """模块 3：执行全局扩散生图与跨风格迁移"""
         print(f"[PROCESS] Executing global style transfer...")
         print(f"[INFO] Applied Prompt: '{prompt}' | Strength: {strength}")
         
-        init_image = Image.open(image_path).convert("RGB").resize((512, 512)) # 读取图源并硬缩放至扩散模型基准 512 分辨率
+        init_image_raw = Image.open(image_path).convert("RGB")
+        target_size = self._get_optimal_sdxl_size(init_image_raw)
+        init_image = init_image_raw.resize(target_size)
         generator = torch.Generator(device=self.device).manual_seed(42)
+
+        num_steps = 20
+        actual_steps = max(1, int(num_steps * strength))
+
+        def diffusers_callback(pipe, step_index, timestep, callback_kwargs):
+            if step_callback is not None:
+                step_callback(step_index + 1, actual_steps)
+            return callback_kwargs
         
         with torch.no_grad():
             image = self.sd_pipeline(
-                prompt=prompt, image=init_image, strength=strength, generator=generator # 执行加噪与逐步去噪循环，输出混合图像
+                prompt=prompt, 
+                image=init_image, 
+                strength=strength, 
+                generator=generator,
+                num_inference_steps=20, 
+                guidance_scale=guidance_scale,
+                width=target_size[0],
+                height=target_size[1],
+                callback_on_step_end=diffusers_callback
             ).images[0]
             
         image.save(output_path)
         print(f"[SUCCESS] Stylized image saved to: {output_path}")
         return output_path
 
-    def auto_inpaint(self, image_path: str, mask_target_text: str, addition_prompt: str, output_path: str) -> str:
+    def auto_inpaint(
+            self, 
+            image_path: str, 
+            mask_target_text: str, 
+            addition_prompt: str, 
+            output_path: str, 
+            base_desc: str = "", 
+            guidance_scale: float = 8.5, 
+            strength: float = 0.9,
+            step_callback=None
+        ) -> str:
         """模块 4：执行基于语义掩膜的局部内容创造性注入"""
         print(f"[PROCESS] Executing targeted auto-inpainting...")
         print(f"[INFO] Auto-Masking: '{mask_target_text}' | Painting: '{addition_prompt}'")
         
         init_image_raw = Image.open(image_path).convert("RGB")
-        init_image_512 = init_image_raw.resize((512, 512)) # 准备基础画布张量
+        target_size = self._get_optimal_sdxl_size(init_image_raw)
+        init_image_dynamic = init_image_raw.resize(target_size)
+        init_image_1024 = init_image_raw.resize((1024, 1024)) # 准备基础画布张量
         
         # 动态请求 CLIPSeg 模块输出目标区域的二值化隔离区
-        mask_image = self._generate_text_mask(init_image_raw, mask_target_text, target_size=(512, 512)) 
+        mask_image = self._generate_text_mask(init_image_raw, mask_target_text, target_size=target_size)
         
-        full_prompt = f"{addition_prompt}, highly detailed, cinematic lighting, matching original art style" # 组装高质量正向提示词体系
-        neg_prompt = "ugly, blurry, low quality, deformed, artifacts, text, watermark" # 注入负面提示词，抑制伪影和画面崩坏
+        # context_prompt = f"in the exact style of ({base_desc})" if base_desc else "matching original art style"
+        style_anchor = "perfectly matching the original image's artistic style, color palette, lighting, and aesthetic"
+        full_prompt = f"{addition_prompt}, {style_anchor}, seamless integration, masterpiece" 
+        
+        num_steps = 20
+        actual_steps = max(1, int(num_steps * strength))
+
+        def diffusers_callback(pipe, step_index, timestep, callback_kwargs):
+            if step_callback is not None:
+                # 告诉前端：当前是第几步，总共几步
+                step_callback(step_index + 1, actual_steps)
+            return callback_kwargs # 必须返回 kwargs，这是底层的死规矩
+
+        # 恢复通用的、治本的负面提示词，专注打击质量问题和风格冲突
+        neg_prompt = "ugly, deformed, artifacts, poorly drawn, out of context, mismatching style, photorealistic (if original is art)"
         generator = torch.Generator(device="cpu").manual_seed(42)
 
         with torch.no_grad():
             result = self.inpaint_pipeline(
                 prompt=full_prompt,
                 negative_prompt=neg_prompt,
-                image=init_image_512,  # 传入基础图像
+                image=init_image_dynamic,  # 传入基础图像
                 mask_image=mask_image, # 传入黑白掩膜 (黑区锁定不变，白区重新计算生成)
-                num_inference_steps=40, # 提升去噪步数以获取更精密的局部结构
-                guidance_scale=8.5,    # 拉高对文本提示的遵循权重
-                strength=0.9,          # 提高局部重绘的重构强度，彻底覆盖旧区域
-                generator=generator
+                num_inference_steps=20, # 提升去噪步数以获取更精密的局部结构
+                guidance_scale=guidance_scale,    # 拉高对文本提示的遵循权重
+                strength=strength,          # 提高局部重绘的重构强度，彻底覆盖旧区域
+                generator=generator,
+                width=target_size[0],
+                height=target_size[1],
+                callback_on_step_end=diffusers_callback
             )
             
         result.images[0].save(output_path)
@@ -204,7 +310,8 @@ class ArtRestorationSystem:
                 image_path=current_image_path,
                 mask_target_text=inpaint_config["mask_target"], # 提取掩膜探测词
                 addition_prompt=inpaint_config["addition_prompt"], # 提取新元素生成指令
-                output_path=inpainted_path
+                output_path=inpainted_path,
+                base_desc=base_desc
             ) # 指针覆写为局部合成图像
 
         # 节点 D: 全局风格滤镜层拦截与处理
@@ -268,4 +375,4 @@ if __name__ == "__main__":
         art_sys.run_dynamic_pipeline(input_image=test_image, options=config_full)
         
     else:
-        print(f"[ERROR] Required input file not found: {test_image}")   # 抛出运行时文件失联异常
+        print(f"[ERROR] Required input file not found: {test_image}") # 抛出运行时文件失联异常
